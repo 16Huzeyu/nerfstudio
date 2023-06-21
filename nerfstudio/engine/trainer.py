@@ -264,7 +264,7 @@ class Trainer:
                         step=step,
                         avg_over_steps=True,
                     )
-
+                    writer.put_scalar(name=EventName.CURR_TEST_PSNR, scalar=metrics_dict["psnr"], step=step)
                 self._update_viewer_state(step)
 
                 # a batch of train rays
