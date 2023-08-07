@@ -218,12 +218,13 @@ class Nerfstudio(DataParser):
             orientation_method = self.config.orientation_method
 
         poses = torch.from_numpy(np.array(poses).astype(np.float32))
+        print(orientation_method)
         poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
             poses,
             method=orientation_method,
             center_method=self.config.center_method,
         )
-
+        print(poses[:, 2, 3])
         # Scale poses
         scale_factor = 1.0
         if self.config.auto_scale_poses:
@@ -231,7 +232,8 @@ class Nerfstudio(DataParser):
         scale_factor *= self.config.scale_factor
 
         poses[:, :3, 3] *= scale_factor
-
+        print(self.config.center_method)
+        print(poses[:, 2, 3])
         # Choose image_filenames and poses based on split, but after auto orient and scaling the poses.
         image_filenames = [image_filenames[i] for i in indices]
         mask_filenames = [mask_filenames[i] for i in indices] if len(mask_filenames) > 0 else []

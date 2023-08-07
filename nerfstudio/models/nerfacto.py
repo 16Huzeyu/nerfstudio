@@ -19,8 +19,7 @@ NeRF implementation that combines many recent advancements.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Tuple, Type
-
+from typing import Dict, List, Literal, Tuple, Type, Union
 import numpy as np
 import torch
 from torch.nn import Parameter
@@ -45,6 +44,7 @@ from nerfstudio.model_components.losses import (
     orientation_loss,
     pred_normal_loss,
     scale_gradients_by_distance_squared,
+    robust_rgb_loss
 )
 from nerfstudio.model_components.ray_samplers import (
     ProposalNetworkSampler,
@@ -132,7 +132,10 @@ class NerfactoModelConfig(ModelConfig):
     """Use gradient scaler where the gradients are lower for points closer to the camera."""
     implementation: Literal["tcnn", "torch"] = "tcnn"
     """Which implementation to use for the model."""
-
+    robust: bool = False
+    """Whether to use robust RGB loss or not."""
+    patch_size: int = 16
+    """Patch size to use for robust RGB loss."""
 
 class NerfactoModel(Model):
     """Nerfacto model
@@ -224,6 +227,7 @@ class NerfactoModel(Model):
         self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
         self.renderer_accumulation = AccumulationRenderer()
         self.renderer_depth = DepthRenderer()
+
         self.renderer_normals = NormalsRenderer()
 
         # shaders
@@ -278,14 +282,119 @@ class NerfactoModel(Model):
         return callbacks
 
     def get_outputs(self, ray_bundle: RayBundle):
+        #print(ray_bundle.origins.shape)
         ray_samples: RaySamples
+        #print("ray_bundle.origins.shape")
         ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+        # print("ray_samples.frustums")
+        # print(ray_samples.frustums.starts)
+        # print(ray_samples.frustums.starts.shape)
+        # print(ray_samples.frustums.ends)
         field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
         if self.config.use_gradient_scaling:
             field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
 
         weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
         weights_list.append(weights)
+        # print(field_outputs[FieldHeadNames.DENSITY].shape)
+        # print(field_outputs[FieldHeadNames.RGB].shape)
+        # print("len")
+        ray_samples_list.append(ray_samples)
+
+        rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
+        depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+        accumulation = self.renderer_accumulation(weights=weights)
+
+        outputs = {
+            "rgb": rgb,
+            "accumulation": accumulation,
+            "depth": depth,
+        }
+
+        if self.config.predict_normals:
+            normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
+            pred_normals = self.renderer_normals(field_outputs[FieldHeadNames.PRED_NORMALS], weights=weights)
+            outputs["normals"] = self.normals_shader(normals)
+            outputs["pred_normals"] = self.normals_shader(pred_normals)
+            
+        # These use a lot of GPU memory, so we avoid storing them for eval.
+        if self.training:
+            outputs["weights_list"] = weights_list
+            outputs["ray_samples_list"] = ray_samples_list
+
+        if self.training and self.config.predict_normals:
+            outputs["rendered_orientation_loss"] = orientation_loss(
+                weights.detach(), field_outputs[FieldHeadNames.NORMALS], ray_bundle.directions
+            )
+
+            outputs["rendered_pred_normal_loss"] = pred_normal_loss(
+                weights.detach(),
+                field_outputs[FieldHeadNames.NORMALS].detach(),
+                field_outputs[FieldHeadNames.PRED_NORMALS],
+            )
+
+        for i in range(self.config.num_proposal_iterations):
+            outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
+
+        return outputs
+    
+    def get_outputs_with_field(self, ray_bundle: RayBundle,field:Dict[FieldHeadNames, Union[torch.Tensor, List]]):
+        #print(ray_bundle.origins.shape)
+        ray_samples: RaySamples
+        #print("ray_bundle.origins.shape")
+        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+        #print(ray_samples.frustums.starts)
+        field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
+        if self.config.use_gradient_scaling:
+            field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
+            
+        p1 = ray_samples.frustums.starts.to(self.device)
+        p2 = field[FieldHeadNames.POSITIONS]
+        p2 = torch.where(p2 == 0, float('inf'), p2)
+        p2 =  p2.add(0.08)
+        print( p2)
+        print(field[FieldHeadNames.POSITIONS].shape)
+        print("最大值:", torch.min(p2))
+        print("最大值:", torch.max(p1))
+        print("len2323")
+        less_than_p2 = torch.ge(p1,  p2 )
+
+        #使用 torch.nonzero() 获取为 True 的位置索引
+        indices = torch.nonzero(less_than_p2 )
+        if len(indices) > 0:
+            start = 0
+            for i in range(indices.size(0)):  # 遍历所有样本
+                
+                if(indices[i][0]>start):
+                    start = indices[i][0]
+                    k  = indices[i][0]
+                    j = indices[i][1]
+                    field_outputs[FieldHeadNames.DENSITY][k, j:] = field[FieldHeadNames.DENSITY][k, :48-j]
+                    field_outputs[FieldHeadNames.RGB][k, j:] = field[FieldHeadNames.RGB][k, :48-j]
+        # start = 0
+        # end = 48
+        # maskA = field[FieldHeadNames.DENSITY][:, start:end, :] != 0  # 创建一个布尔掩码，用于表示B中非零值的位置1
+        # maskA = maskA.to(field_outputs[FieldHeadNames.DENSITY].device)
+        # #提取最大值、最小值和中间值
+        # max_value = torch.max(field_outputs[FieldHeadNames.DENSITY][0])
+        # min_value = torch.min(field_outputs[FieldHeadNames.DENSITY][0])
+        # median_value = torch.median(field_outputs[FieldHeadNames.DENSITY][0])
+
+        # print("最大值:", max_value.item())
+        # print("最小值:", min_value.item())
+        # print("中间值:", median_value.item())
+        # maskB = field[FieldHeadNames.RGB][:, start:end, :] != 0  # 创建一个布尔掩码，用于表示B中非零值的位置
+        # maskB = maskB.to(field_outputs[FieldHeadNames.RGB].device)
+        
+        # field_outputs[FieldHeadNames.DENSITY][:,start:end, :][maskA] = field[FieldHeadNames.DENSITY][:, start:end , :][maskA]
+        # field_outputs[FieldHeadNames.RGB][:,start:end, :][maskB] = field[FieldHeadNames.RGB][:, start:end , :][maskB]
+        # field_outputs[FieldHeadNames.DENSITY]= field[FieldHeadNames.DENSITY]
+        # field_outputs[FieldHeadNames.RGB] = field[FieldHeadNames.RGB]
+        print(field_outputs[FieldHeadNames.DENSITY].shape)
+        print(field_outputs[FieldHeadNames.RGB].shape)
+        weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
+        weights_list.append(weights)
+
         ray_samples_list.append(ray_samples)
 
         rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
@@ -322,8 +431,130 @@ class NerfactoModel(Model):
         for i in range(self.config.num_proposal_iterations):
             outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
 
-        return outputs
+        return outputs   
+   
+    def get_outputs_with_whole_field(self, ray_bundle: RayBundle,field:Dict[FieldHeadNames, Union[torch.Tensor, List]],model:Model):
+        #print(ray_bundle.origins.shape)
+        ray_samples: RaySamples
+        #print("ray_bundle.origins.shape")
+        ray_samples, weights_list, ray_samples_list =self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+        #print(ray_samples.frustums.starts)
+        field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
+        
+        print(field_outputs[FieldHeadNames.DENSITY].shape)
+        if self.config.use_gradient_scaling:
+            field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
+            
+        # 提取最大值、最小值和中间值
+        max_value = torch.max(field_outputs[FieldHeadNames.DENSITY][0])
+        min_value = torch.min(field_outputs[FieldHeadNames.DENSITY][0])
+        median_value = torch.median(field_outputs[FieldHeadNames.DENSITY][0])
+        p1 = ray_samples.frustums.get_positions().to(self.device)
+        p2 = field[FieldHeadNames.POSITIONS].view(-1,48,3).to(self.device)
 
+        
+        center_p1 = torch.tensor([0.35, -0.16, -0.1]).to(self.device)  # p1位置的中心点坐标
+        size_p1 = torch.tensor([0.1, 0.07, 0.05]).to(self.device)  # p1位置的长宽高
+        center_p2 = torch.tensor([-0.15, 0, -0.13]).to(self.device)  # p2位置的中心点坐标
+        size_p2 = torch.tensor([0.50, 0.17, 0.14]).to(self.device)  # p2位置的长宽高
+        # 计算p1位置的范围
+        min_p1 = center_p1 - size_p1 / 2
+        max_p1 = center_p1 + size_p1 / 2
+        is_between = torch.any((min_p1<= p1 ) & (p1 <= max_p1))
+
+# 输出结果
+        
+        if is_between:
+        # 计算映射的缩放比例
+            scale = (size_p2 / size_p1).unsqueeze(0)
+            print("ifbetween")
+            # 进行映射并找到最近点对应的RGB值
+            for i in range(field_outputs[FieldHeadNames.DENSITY].shape[0]):
+                for j in range(field_outputs[FieldHeadNames.DENSITY].shape[1]):
+                    if torch.all((min_p1 <= p1[i, j]) & (p1[i, j] <= max_p1)):
+                        mapped_p1 = (p1[i, j] - min_p1) * scale + center_p2
+                        # 找到p2位置中与映射结果最近的点的索引
+                        distance = torch.norm(p2 - mapped_p1, dim=2).view(-1)
+                    
+
+                        # 找到最小值对应的索引（x，y）
+                        min_indices = torch.argmin( distance)
+
+                        # 分解索引为（x，y）坐标
+                        x_indices = min_indices // 48
+                        y_indices = min_indices % 48
+
+                        # 打印索引结果
+
+                        # 将P1位置在指定范围内的RGB值替换为P2位置最近点的RGB值
+                        field_outputs[FieldHeadNames.DENSITY][i, j] = field[FieldHeadNames.DENSITY][x_indices, y_indices]
+                        field_outputs[FieldHeadNames.RGB][i, j] = field[FieldHeadNames.RGB][x_indices,y_indices]
+
+                        print(x_indices, y_indices)
+                        print("min_index")
+
+
+        
+        
+        
+        print(field_outputs[FieldHeadNames.DENSITY].shape)
+        print(field_outputs[FieldHeadNames.RGB].shape)
+        weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
+        weights_list.append(weights)
+
+        ray_samples_list.append(ray_samples)
+
+        rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
+        depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+        accumulation = self.renderer_accumulation(weights=weights)
+
+        outputs = {
+            "rgb": rgb,
+            "accumulation": accumulation,
+            "depth": depth,
+        }
+
+        if self.config.predict_normals:
+            normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
+            pred_normals = self.renderer_normals(field_outputs[FieldHeadNames.PRED_NORMALS], weights=weights)
+            outputs["normals"] = self.normals_shader(normals)
+            outputs["pred_normals"] = self.normals_shader(pred_normals)
+        # These use a lot of GPU memory, so we avoid storing them for eval.
+        if self.training:
+            outputs["weights_list"] = weights_list
+            outputs["ray_samples_list"] = ray_samples_list
+
+        if self.training and self.config.predict_normals:
+            outputs["rendered_orientation_loss"] = orientation_loss(
+                weights.detach(), field_outputs[FieldHeadNames.NORMALS], ray_bundle.directions
+            )
+
+            outputs["rendered_pred_normal_loss"] = pred_normal_loss(
+                weights.detach(),
+                field_outputs[FieldHeadNames.NORMALS].detach(),
+                field_outputs[FieldHeadNames.PRED_NORMALS],
+            )
+
+        for i in range(self.config.num_proposal_iterations):
+            outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
+
+        return outputs   
+    
+    def get_fieldout(self, ray_bundle: RayBundle):
+        #print(ray_bundle.origins.shape)
+        ray_samples: RaySamples
+        #print("ray_bundle.origins.shape")
+        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+        #print(ray_samples.frustums.starts)
+        field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
+        if self.config.use_gradient_scaling:
+            field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
+        print("positions")
+        positions = ray_samples.frustums.starts
+        print(positions.size())
+ 
+        return field_outputs, positions
+    
     def get_metrics_dict(self, outputs, batch):
         metrics_dict = {}
         image = batch["image"].to(self.device)
@@ -335,7 +566,10 @@ class NerfactoModel(Model):
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = {}
         image = batch["image"].to(self.device)
-        loss_dict["rgb_loss"] = self.rgb_loss(image, outputs["rgb"])
+        if self.config.robust:
+            loss_dict["rgb_loss"] = robust_rgb_loss(image, outputs["rgb"], self.config.patch_size)
+        else:
+            loss_dict["rgb_loss"] = self.rgb_loss(image, outputs["rgb"])
         if self.training:
             loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
                 outputs["weights_list"], outputs["ray_samples_list"]
@@ -352,6 +586,7 @@ class NerfactoModel(Model):
                 loss_dict["pred_normal_loss"] = self.config.pred_normal_loss_mult * torch.mean(
                     outputs["rendered_pred_normal_loss"]
                 )
+
         return loss_dict
 
     def get_image_metrics_and_images(

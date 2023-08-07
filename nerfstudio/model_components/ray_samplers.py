@@ -116,7 +116,8 @@ class SpacedSampler(Sampler):
             return self.spacing_fn_inv(x * s_far + (1 - x) * s_near)
 
         euclidean_bins = spacing_to_euclidean_fn(bins)  # [num_rays, num_samples+1]
-
+        # print("euclidean_bins")
+        # print(torch.min(euclidean_bins))
         ray_samples = ray_bundle.get_ray_samples(
             bin_starts=euclidean_bins[..., :-1, None],
             bin_ends=euclidean_bins[..., 1:, None],

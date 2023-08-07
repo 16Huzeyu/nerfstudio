@@ -18,7 +18,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional, Tuple, Type
-
+import shutil
 import numpy as np
 import pyquaternion
 import torch
@@ -62,7 +62,7 @@ class NuScenesDataParserConfig(DataParserConfig):
     """target class to instantiate"""
     data: Path = Path("scene-0103")  # TODO: rename to scene but keep checkpoint saving name?
     """Name of the scene."""
-    data_dir: Path = Path("/mnt/local/NuScenes")
+    data_dir: Path = Path("/mnt/cos/ML_data/nuscenes")
     """Path to NuScenes dataset."""
     version: Literal["v1.0-mini", "v1.0-trainval"] = "v1.0-mini"
     """Dataset version."""
@@ -92,9 +92,9 @@ class NuScenes(DataParser):
         )
         cameras = ["CAM_" + camera for camera in self.config.cameras]
 
-        assert (
-            len(cameras) == 1
-        ), "waiting on multiple camera support"  # TODO: remove once multiple cameras are supported
+        # assert (
+        #     len(cameras) == 1
+        # ), "waiting on multiple camera support"  # TODO: remove once multiple cameras are supported
 
         # get samples for scene
         samples = [
@@ -216,4 +216,12 @@ class NuScenes(DataParser):
             scene_box=scene_box,
             mask_filenames=mask_filenames if self.config.mask_dir is not None else None,
         )
+        
+        
+        # filedir='/home/ubuntu/project/nerf/nerfstudio/data/nuscenes2/'
+        # print (image_filenames)
+        # for image in image_filenames:
+
+        #     shutil.copy(image, os.path.join(filedir, 'images'))
+
         return dataparser_outputs

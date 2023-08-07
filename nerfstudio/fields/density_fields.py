@@ -100,6 +100,8 @@ class HashMLPDensityField(Field):
         selector = ((positions > 0.0) & (positions < 1.0)).all(dim=-1)
         positions = positions * selector[..., None]
         positions_flat = positions.view(-1, 3)
+        # print(positions.shape)
+        # print("g")
         if not self.use_linear:
             density_before_activation = (
                 self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1).to(positions)

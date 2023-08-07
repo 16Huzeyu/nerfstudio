@@ -33,7 +33,14 @@ from nerfstudio.configs.config_utils import to_immutable_dict
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
 from nerfstudio.model_components.scene_colliders import NearFarCollider
-
+from nerfstudio.field_components.field_heads import (
+    FieldHeadNames,
+    PredNormalsFieldHead,
+    SemanticFieldHead,
+    TransientDensityFieldHead,
+    TransientRGBFieldHead,
+    UncertaintyFieldHead,
+)
 
 # Model related configs
 @dataclass
@@ -125,7 +132,42 @@ class Model(nn.Module):
         Returns:
             Outputs of model. (ie. rendered colors)
         """
+        
+    @abstractmethod
+    def get_fieldout(self, ray_bundle: RayBundle) -> Dict[str, Union[torch.Tensor, List]]:
+        """Takes in a Ray Bundle and returns a dictionary of outputs.
 
+        Args:
+            ray_bundle: Input bundle of rays. This raybundle should have all the
+            needed information to compute the outputs.
+
+        Returns:
+            Outputs of model. (ie. rendered colors)
+        """
+        
+    @abstractmethod
+    def get_outputs_with_field(self, ray_bundle: RayBundle,field:Dict[FieldHeadNames, Union[torch.Tensor, List]]) -> Dict[str, Union[torch.Tensor, List]]:
+        """Takes in a Ray Bundle and returns a dictionary of outputs.
+
+        Args:
+            ray_bundle: Input bundle of rays. This raybundle should have all the
+            needed information to compute the outputs.
+
+        Returns:
+            Outputs of model. (ie. rendered colors)
+        """
+         
+    @abstractmethod
+    def get_outputs_with_whole_field(self, ray_bundle: RayBundle,field:Dict[FieldHeadNames, Union[torch.Tensor, List]],model:Model) -> Dict[str, Union[torch.Tensor, List]]:
+        """Takes in a Ray Bundle and returns a dictionary of outputs.
+
+        Args:
+            ray_bundle: Input bundle of rays. This raybundle should have all the
+            needed information to compute the outputs.
+
+        Returns:
+            Outputs of model. (ie. rendered colors)
+        """         
     def forward(self, ray_bundle: RayBundle) -> Dict[str, Union[torch.Tensor, List]]:
         """Run forward starting with a ray bundle. This outputs different things depending on the configuration
         of the model and whether or not the batch is provided (whether or not we are training basically)
@@ -173,7 +215,8 @@ class Model(nn.Module):
         for i in range(0, num_rays, num_rays_per_chunk):
             start_idx = i
             end_idx = i + num_rays_per_chunk
-            ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+            ray_bundle= camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+
             outputs = self.forward(ray_bundle=ray_bundle)
             for output_name, output in outputs.items():  # type: ignore
                 if not torch.is_tensor(output):
@@ -184,7 +227,112 @@ class Model(nn.Module):
         for output_name, outputs_list in outputs_lists.items():
             outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
         return outputs
+    
+    @torch.no_grad()
+    def convert_to_coordinates(self, integer,h,w):
+        y = integer % w
+        x = integer // w
 
+        return x, y   
+    
+    @torch.no_grad()
+    def get_outputs_mix(self, camera_ray_bundle: RayBundle,fieldout:Dict[FieldHeadNames, torch.Tensor],model:Model) -> Dict[str, torch.Tensor]:
+        """Takes in camera parameters and computes the output of the model.
+
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+        """
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        num_rays = len(camera_ray_bundle)
+        print("num_rays")
+        print(num_rays)
+        fieldout[FieldHeadNames.RGB]=fieldout[FieldHeadNames.RGB].view(image_height, image_width,48,3)
+        fieldout[FieldHeadNames.DENSITY]=fieldout[FieldHeadNames.DENSITY].view(image_height, image_width,48,1)
+        fieldout[FieldHeadNames.POSITIONS]=fieldout[FieldHeadNames.POSITIONS].view(image_height, image_width,48,1)
+        # 创建一个全为0的掩码张量
+        start_point = (557 , 650 )
+        #end_point = ( 719 , 889)
+        end_point = (558 , 651 )
+        mask = torch.zeros(image_height, image_width, 48).to(fieldout[FieldHeadNames.RGB].device)
+
+        # 将范围内的掩码值置为1
+        mask[start_point[0]:end_point[0], start_point[1]:end_point[1], :] = 1
+
+        # 将范围外的值置为0
+        fieldout[FieldHeadNames.RGB] *= mask.unsqueeze(-1)
+        fieldout[FieldHeadNames.DENSITY] *= mask.unsqueeze(-1)
+        fieldout[FieldHeadNames.POSITIONS] *= mask.unsqueeze(-1)
+
+
+        fieldout[FieldHeadNames.RGB]=fieldout[FieldHeadNames.RGB].view(-1,48,3)
+        fieldout[FieldHeadNames.DENSITY]=fieldout[FieldHeadNames.DENSITY].view(-1,48,1)
+        fieldout[FieldHeadNames.POSITIONS]=fieldout[FieldHeadNames.POSITIONS].view(-1,48,1)
+        print(fieldout[FieldHeadNames.RGB].shape)
+        print(fieldout[FieldHeadNames.DENSITY].shape)
+        outputs_lists = defaultdict(list)
+        for i in range(0, num_rays, num_rays_per_chunk):
+            x,y = self.convert_to_coordinates(i,image_height,image_width)
+            start_idx = i
+            end_idx = i + num_rays_per_chunk
+            ray_bundle= camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+            #print("camera")
+            print(num_rays_per_chunk)
+            rgbTensor = fieldout[FieldHeadNames.RGB][start_idx:end_idx]
+            densityTensor = fieldout[FieldHeadNames.DENSITY][start_idx:end_idx]
+            positonTensor = fieldout[FieldHeadNames.POSITIONS][start_idx:end_idx]
+            print(densityTensor.shape)
+            print("densityTensor")
+            field_cut = {}
+            field_cut[FieldHeadNames.RGB] = rgbTensor
+            field_cut[FieldHeadNames.DENSITY] = densityTensor
+            field_cut[FieldHeadNames.POSITIONS] = positonTensor
+            if self.collider is not None:
+                ray_bundle = self.collider(ray_bundle)
+            #outputs = self.get_outputs_with_field(ray_bundle=ray_bundle,field=field_cut)
+            outputs = self.get_outputs_with_whole_field(ray_bundle=ray_bundle,field=fieldout,model=model)
+            for output_name, output in outputs.items():  # type: ignore
+                if not torch.is_tensor(output):
+                    # TODO: handle lists of tensors as well
+                    continue
+                outputs_lists[output_name].append(output)
+        outputs = {}
+        for output_name, outputs_list in outputs_lists.items():
+            outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
+        return outputs   
+    
+    @torch.no_grad()
+    def get_fieldoutputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[FieldHeadNames, torch.Tensor]:
+        """Takes in camera parameters and computes the output of the model.
+
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+        """
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        num_rays = len(camera_ray_bundle)
+        outputs_lists = defaultdict(list)
+        for i in range(0, num_rays, num_rays_per_chunk):
+            start_idx = i
+            end_idx = i + num_rays_per_chunk
+            ray_bundle= camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+            print("cameracccc")
+            if self.collider is not None:
+                ray_bundle = self.collider(ray_bundle)
+            outputs, positons = self.get_fieldout(ray_bundle=ray_bundle)
+
+            for output_name, output in outputs.items():  # type: ignore
+                if not torch.is_tensor(output):
+                    # TODO: handle lists of tensors as well
+                    continue
+                outputs_lists[output_name].append(output)
+            outputs_lists[FieldHeadNames.POSITIONS].append( positons)
+        outputs = {}
+        for output_name, outputs_list in outputs_lists.items():
+            outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
+
+        return outputs
+    
     @abstractmethod
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]

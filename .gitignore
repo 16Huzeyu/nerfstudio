@@ -170,7 +170,7 @@ events.out.*
 
 # Data
 /data
-
+/mesh
 # Misc
 old/
 temp*

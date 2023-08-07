@@ -17,7 +17,7 @@
 render.py
 """
 from __future__ import annotations
-
+import copy
 import json
 import os
 import struct
@@ -65,6 +65,7 @@ from nerfstudio.utils.scripts import run_command
 
 def _render_trajectory_video(
     pipeline: Pipeline,
+    
     cameras: Cameras,
     output_filename: Path,
     rendered_output_names: List[str],
@@ -75,6 +76,7 @@ def _render_trajectory_video(
     image_format: Literal["jpeg", "png"] = "jpeg",
     jpeg_quality: int = 100,
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions(),
+    pipeline2: Optional[Pipeline]=None,
 ) -> None:
     """Helper function to create a video of the spiral trajectory.
 
@@ -122,14 +124,29 @@ def _render_trajectory_video(
         writer = None
 
         with progress:
+            firstcamera = None
             for camera_idx in progress.track(range(cameras.size), description=""):
                 aabb_box = None
                 if crop_data is not None:
                     bounding_box_min = crop_data.center - crop_data.scale / 2.0
                     bounding_box_max = crop_data.center + crop_data.scale / 2.0
                     aabb_box = SceneBox(torch.stack([bounding_box_min, bounding_box_max]).to(pipeline.device))
+                center_p1 = torch.tensor([0.35, -0.16, -0.1]).to(pipeline.device)  # p1位置的中心点坐标
+                size_p1 = torch.tensor([0.1, 0.07, 0.05]).to(pipeline.device)  # p1位置的长宽高
+                center_p2 = torch.tensor([-0.15, 0, -0.13]).to(pipeline.device)  # p2位置的中心点坐标
+                size_p2 = torch.tensor([0.50, 0.17, 0.14]).to(pipeline.device)  # p2位置的长宽高
+                # 计算p1位置的范围
+                min_p1 = center_p2 - size_p2 / 2
+                max_p1 = center_p2 + size_p2 / 2       
+                #aabb_box = SceneBox(torch.stack([min_p1 , max_p1]).to(pipeline.device))
+                         
                 camera_ray_bundle = cameras.generate_rays(camera_indices=camera_idx, aabb_box=aabb_box)
 
+                print("camera_ray_bundle.nears")
+                if firstcamera is None:
+                    firstcamera = camera_ray_bundle.origins
+                    subtract_value = torch.tensor([-0.2, -0.2, 0]).to(pipeline.device)
+                    firstcamera = firstcamera  -subtract_value
                 if crop_data is not None:
                     with renderers.background_color_override_context(
                         crop_data.background_color.to(pipeline.device)
@@ -137,7 +154,25 @@ def _render_trajectory_video(
                         outputs = pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
                 else:
                     with torch.no_grad():
+                        # print(camera_ray_bundle.origins)
+                        # print("camera3")
+                        
+                        #camera_ray_bundle2 = copy.deepcopy(camera_ray_bundle)
+                        #camera_ray_bundle2.origins = firstcamera
+                        # print(camera_ray_bundle.origins)
+                        # outputs2 = pipeline2.model.get_fieldoutputs_for_camera_ray_bundle(camera_ray_bundle2)
+                        # print("output2")
+                               
+                        # outputs = pipeline.model.get_outputs_mix(camera_ray_bundle,outputs2,pipeline2.model)
                         outputs = pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+                        #print("output2")
+                        #print(outputs2)
+                        #print("camera2")
+                        #print(outputs2['rgb'].shape)
+
+                        
+                        #outputs['rgb'][250:600,333:1000, :] = outputs2['rgb'][250:600,333:1000, :]
+                
 
                 render_image = []
                 for rendered_output_name in rendered_output_names:
@@ -335,7 +370,11 @@ class RenderCameraPath(BaseRender):
             eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
             test_mode="inference",
         )
-
+        _, pipeline2, _, _ = eval_setup(
+            Path('outputs/car10/nerfacto/2023-07-12_180516/config.yml'),
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="test",
+        )
         install_checks.check_ffmpeg_installed()
 
         with open(self.camera_path_filename, "r", encoding="utf-8") as f:
@@ -372,6 +411,7 @@ class RenderCameraPath(BaseRender):
             image_format=self.image_format,
             jpeg_quality=self.jpeg_quality,
             colormap_options=self.colormap_options,
+            pipeline2= pipeline2,
         )
 
         if camera_path.camera_type[0] == CameraType.OMNIDIRECTIONALSTEREO_L.value:
@@ -444,7 +484,11 @@ class RenderInterpolated(BaseRender):
             eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
             test_mode="test",
         )
-
+        _, pipeline2, _, _ = eval_setup(
+             Path('outputs/car10/nerfacto/2023-07-12_180516/config.yml'),
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="test",
+        )
         install_checks.check_ffmpeg_installed()
 
         if self.pose_source == "eval":
@@ -470,6 +514,7 @@ class RenderInterpolated(BaseRender):
             seconds=seconds,
             output_format=self.output_format,
             colormap_options=self.colormap_options,
+            pipeline2= pipeline2,
         )
 
 

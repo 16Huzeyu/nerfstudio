@@ -79,7 +79,9 @@ class DepthNerfactoModel(NerfactoModel):
         if self.training:
             metrics_dict["depth_loss"] = 0.0
             sigma = self._get_sigma().to(self.device)
+            
             termination_depth = batch["depth_image"].to(self.device)
+           
             for i in range(len(outputs["weights_list"])):
                 metrics_dict["depth_loss"] += depth_loss(
                     weights=outputs["weights_list"][i],
@@ -109,8 +111,8 @@ class DepthNerfactoModel(NerfactoModel):
         metrics, images = super().get_image_metrics_and_images(outputs, batch)
         ground_truth_depth = batch["depth_image"].to(self.device)
         if not self.config.is_euclidean_depth:
-            ground_truth_depth = ground_truth_depth * outputs["directions_norm"]
-
+            ground_truth_depth = ground_truth_depth * outputs["directions_norm"]  
+            
         ground_truth_depth_colormap = colormaps.apply_depth_colormap(ground_truth_depth)
         predicted_depth_colormap = colormaps.apply_depth_colormap(
             outputs["depth"],

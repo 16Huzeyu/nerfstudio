@@ -206,6 +206,7 @@ class NerfactoField(Field):
             positions = (positions + 2.0) / 4.0
         else:
             positions = SceneBox.get_normalized_positions(ray_samples.frustums.get_positions(), self.aabb)
+        #print(positions.shape)
         # Make sure the tcnn gets inputs between 0 and 1.
         selector = ((positions > 0.0) & (positions < 1.0)).all(dim=-1)
         positions = positions * selector[..., None]
@@ -213,7 +214,11 @@ class NerfactoField(Field):
         if not self._sample_locations.requires_grad:
             self._sample_locations.requires_grad = True
         positions_flat = positions.view(-1, 3)
+
+        #print(positions_flat)
         h = self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1)
+        # print("h")
+        # print(h.shape)
         density_before_activation, base_mlp_out = torch.split(h, [1, self.geo_feat_dim], dim=-1)
         self._density_before_activation = density_before_activation
 
@@ -293,6 +298,7 @@ class NerfactoField(Field):
             ],
             dim=-1,
         )
+
         rgb = self.mlp_head(h).view(*outputs_shape, -1).to(directions)
         outputs.update({FieldHeadNames.RGB: rgb})
 

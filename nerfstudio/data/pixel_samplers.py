@@ -62,15 +62,31 @@ class PixelSampler:
             num_images: number of images to sample over
             mask: mask of possible pixels in an image to sample from.
         """
-        if isinstance(mask, torch.Tensor):
-            nonzero_indices = torch.nonzero(mask[..., 0], as_tuple=False)
-            chosen_indices = random.sample(range(len(nonzero_indices)), k=batch_size)
-            indices = nonzero_indices[chosen_indices]
-        else:
-            indices = torch.floor(
-                torch.rand((batch_size, 3), device=device)
+        max_sample_iter = 3 if isinstance(mask, Tensor) else 1
+
+        indices = None
+        for i in range(max_sample_iter):
+            left_size = batch_size if i == 0 else (batch_size - indices.shape[0])
+            if left_size == 0:
+                break
+            new_indices = torch.floor(
+                torch.rand((left_size, 3), device=device)
                 * torch.tensor([num_images, image_height, image_width], device=device)
             ).long()
+
+            if isinstance(mask, Tensor):
+                valid = mask[new_indices[:,0], new_indices[:, 1], new_indices[:, 2], 0]
+                nonzero_indices = torch.nonzero(valid)[:, 0]
+                new_indices = new_indices[nonzero_indices]
+
+            if i == 0:
+                indices = new_indices
+            else:
+                indices = torch.cat([indices, new_indices], dim=0)
+
+        if indices.shape[0] < batch_size:
+            left_size = batch_size - indices.shape[0]
+            indices = torch.cat([indices, indices[:left_size]], dim=0)
 
         return indices
 
